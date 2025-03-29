@@ -108,7 +108,14 @@ async def secure_ban_and_restore(guild, user, reason):
         return False, f"Error: {str(e)}"
 
 async def handle_suspicious_action(guild, user, action_type, target=None):
-    """Process suspicious actions with auto-unlock, excluding whitelisted users"""
+    """
+    Process suspicious actions with auto-unlock.
+    If the triggering user has a higher role than the bot, then do nothing.
+    """
+    # Skip actions if the user has a higher role than the bot
+    if user.top_role >= guild.me.top_role:
+        return
+
     alert_channel = await get_alert_channel(guild)
     
     try:
@@ -122,7 +129,7 @@ async def handle_suspicious_action(guild, user, action_type, target=None):
             embed.add_field(name="User", value=f"{user.mention} ({user.id})")
             await alert_channel.send(embed=embed)
 
-        # Take action based on severity if user is not whitelisted
+        # Take action based on severity if user is not whitelisted or higher than bot
         if action_type in ["channel_create", "role_create", "channel_delete", "role_delete", "bot_add"]:
             success, msg = await secure_ban_and_restore(guild, user, f"Suspicious: {action_type}")
             if alert_channel:
