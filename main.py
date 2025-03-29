@@ -18,7 +18,7 @@ BOT_INVITE_PROTECTION = True
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Track original permissions and suspicious activity
+# Track permissions, activity, and whitelisted users
 original_permissions = {}
 user_activity = {}
 whitelisted_users = set()  # Store whitelisted user IDs
@@ -74,12 +74,32 @@ async def get_alert_channel(guild):
         print(f"Error getting alert channel: {e}")
         return None
 
+async def secure_ban_and_restore(guild, user, reason):
+    """Ban user and restore server permissions"""
+    if guild.id not in original_permissions or not original_permissions[guild.id]:
+        await backup_permissions(guild)
+
+    try:
+        # Ensure bot is allowed to ban
+        if user.top_role >= guild.me.top_role:
+            return False, "User has higher role than the bot"
+
+        await guild.ban(user, reason=reason)
+
+        # Restore permissions after ban
+        restore_success = await restore_permissions(guild)
+        return True, f"Banned successfully. Server {'restored' if restore_success else 'restore failed'}"
+    
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
 async def handle_suspicious_action(guild, user, action_type, target=None):
-    """Process suspicious actions with auto-unlock"""
+    """Process suspicious actions with auto-ban"""
     if user.id == guild.owner_id or user.id in whitelisted_users or user.top_role >= guild.me.top_role:
         return  # Ignore actions from server owner, whitelisted users, or users with higher roles
 
     alert_channel = await get_alert_channel(guild)
+
     try:
         # Send alert
         if alert_channel:
@@ -90,13 +110,19 @@ async def handle_suspicious_action(guild, user, action_type, target=None):
             )
             embed.add_field(name="User", value=f"{user.mention} ({user.id})")
             await alert_channel.send(embed=embed)
-    
+
+        # Ban the user
+        success, msg = await secure_ban_and_restore(guild, user, f"Suspicious: {action_type}")
+        if alert_channel:
+            await alert_channel.send(f"Action taken: {msg}")
+
         # Delete suspicious channels/roles
         if target and action_type.endswith("_create"):
             try:
                 await target.delete(reason="Suspicious creation")
             except:
                 pass
+
     except Exception as e:
         print(f"Error handling suspicious action: {e}")
 
@@ -108,10 +134,24 @@ async def on_guild_channel_create(channel):
             break
 
 @bot.event
+async def on_guild_channel_delete(channel):
+    async for entry in channel.guild.audit_logs(action=discord.AuditLogAction.channel_delete, limit=1):
+        if entry.target.id == channel.id:
+            await handle_suspicious_action(channel.guild, entry.user, "channel_delete")
+            break
+
+@bot.event
 async def on_guild_role_create(role):
     async for entry in role.guild.audit_logs(action=discord.AuditLogAction.role_create, limit=1):
         if entry.target.id == role.id:
             await handle_suspicious_action(role.guild, entry.user, "role_create", role)
+            break
+
+@bot.event
+async def on_guild_role_delete(role):
+    async for entry in role.guild.audit_logs(action=discord.AuditLogAction.role_delete, limit=1):
+        if entry.target.id == role.id:
+            await handle_suspicious_action(role.guild, entry.user, "role_delete")
             break
 
 @bot.event
@@ -160,6 +200,21 @@ async def unwhitelist(ctx, member: discord.Member):
     
     whitelisted_users.discard(member.id)
     await ctx.send(f"✅ {member.mention} has been removed from the whitelist!")
+
+# Manual unlock command for server owner
+@bot.command(name='unlock')
+async def manual_unlock(ctx):
+    """Manually restore server permissions"""
+    if ctx.author.id != ctx.guild.owner_id:
+        await ctx.send("❌ Only the server owner can unlock the server!")
+        return
+
+    success = await restore_permissions(ctx.guild)
+    
+    if success:
+        await ctx.send("✅ Server permissions restored!")
+    else:
+        await ctx.send("❌ Failed to restore permissions! Check the bot's role & permissions.")
 
 if __name__ == '__main__':
     try:
