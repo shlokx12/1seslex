@@ -22,6 +22,16 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 original_permissions = {}
 user_activity = {}
 
+# Global whitelist (guild_id: set of user_ids)
+whitelisted_users = {}
+
+def is_whitelisted(guild, user):
+    # Always whitelist the guild owner
+    if user.id == guild.owner_id:
+        return True
+    # Also whitelist any users added via the whitelist command
+    return user.id in whitelisted_users.get(guild.id, set())
+
 async def backup_permissions(guild):
     """Backup current permissions before making changes"""
     original_permissions[guild.id] = {
@@ -74,15 +84,19 @@ async def get_alert_channel(guild):
         return None
 
 async def secure_ban_and_restore(guild, user, reason):
-    """Ban user and restore server permissions"""
+    """Ban user and restore server permissions, except if user is whitelisted"""
     try:
+        # Do not ban if user is whitelisted
+        if is_whitelisted(guild, user):
+            return False, "User is whitelisted; ban skipped."
+        
         # First backup current permissions if not already done
         if guild.id not in original_permissions:
             await backup_permissions(guild)
         
-        # Ban the user
+        # Check role hierarchy (skip banning if target has higher role than bot)
         if user.top_role >= guild.me.top_role:
-            return False, "User has higher role"
+            return False, "User has a higher role than the bot."
         
         await guild.ban(user, reason=reason)
         
@@ -94,7 +108,7 @@ async def secure_ban_and_restore(guild, user, reason):
         return False, f"Error: {str(e)}"
 
 async def handle_suspicious_action(guild, user, action_type, target=None):
-    """Process suspicious actions with auto-unlock"""
+    """Process suspicious actions with auto-unlock, excluding whitelisted users"""
     alert_channel = await get_alert_channel(guild)
     
     try:
@@ -108,17 +122,17 @@ async def handle_suspicious_action(guild, user, action_type, target=None):
             embed.add_field(name="User", value=f"{user.mention} ({user.id})")
             await alert_channel.send(embed=embed)
 
-        # Take action based on severity
+        # Take action based on severity if user is not whitelisted
         if action_type in ["channel_create", "role_create", "channel_delete", "role_delete", "bot_add"]:
             success, msg = await secure_ban_and_restore(guild, user, f"Suspicious: {action_type}")
             if alert_channel:
                 await alert_channel.send(f"Action taken: {msg}")
 
-        # Delete suspicious channels/roles
+        # Delete suspicious channels/roles if applicable
         if target and action_type.endswith("_create"):
             try:
                 await target.delete(reason="Suspicious creation")
-            except:
+            except Exception:
                 pass
 
     except Exception as e:
@@ -222,6 +236,60 @@ async def manual_unlock(ctx):
         await ctx.send("✅ Server permissions restored")
     else:
         await ctx.send("❌ Failed to restore permissions")
+
+# Whitelist command to add or remove users from the whitelist (Owner only)
+@bot.command(name='whitelist')
+async def whitelist(ctx, action: str, member: discord.Member = None):
+    """
+    Manage the whitelist (Owner only).
+    Usage:
+      !whitelist add @member
+      !whitelist remove @member
+      !whitelist list
+    """
+    # Only allow the server owner to use this command
+    if ctx.guild.owner_id != ctx.author.id:
+        await ctx.send("❌ Only the server owner can use the whitelist command.")
+        return
+
+    guild_id = ctx.guild.id
+    # Ensure the guild has a whitelist entry
+    if guild_id not in whitelisted_users:
+        whitelisted_users[guild_id] = set()
+
+    if action.lower() == "add":
+        if member is None:
+            await ctx.send("❌ Please mention a member to add to the whitelist.")
+            return
+        # Prevent adding the guild owner unnecessarily (they're auto-whitelisted)
+        if member.id == ctx.guild.owner_id:
+            await ctx.send("✅ The guild owner is automatically whitelisted.")
+            return
+        whitelisted_users[guild_id].add(member.id)
+        await ctx.send(f"✅ {member.mention} has been added to the whitelist.")
+
+    elif action.lower() == "remove":
+        if member is None:
+            await ctx.send("❌ Please mention a member to remove from the whitelist.")
+            return
+        if member.id in whitelisted_users[guild_id]:
+            whitelisted_users[guild_id].remove(member.id)
+            await ctx.send(f"✅ {member.mention} has been removed from the whitelist.")
+        else:
+            await ctx.send("❌ That member is not in the whitelist.")
+
+    elif action.lower() == "list":
+        if whitelisted_users[guild_id]:
+            members = []
+            for user_id in whitelisted_users[guild_id]:
+                user = ctx.guild.get_member(user_id)
+                members.append(user.mention if user else f"<@{user_id}>")
+            await ctx.send("Whitelisted members:\n" + "\n".join(members))
+        else:
+            await ctx.send("No members are currently whitelisted.")
+
+    else:
+        await ctx.send("❌ Invalid action. Use `add`, `remove`, or `list`.")
 
 if __name__ == '__main__':
     try:
